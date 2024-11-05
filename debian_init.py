@@ -121,9 +121,15 @@ def update_apt():
     print("Updating apt package lists...")
     subprocess.run(['apt', 'update', '-y'])
 
+def install_curl():
+    print("Updating apt package lists...")
+    subprocess.run(['apt', 'inttall', 'curl', '-y'])
+
+
 # Main script execution
 def main():
     print("Starting server initialization configurations...\n")
+    update_apt()
 
     configure_bashrc()
     print(f"Configured {os.path.expanduser('~/.bashrc')}\n")
@@ -137,11 +143,10 @@ def main():
     # Note: Reloading .bashrc in a subprocess won't affect the current shell
     reload_bashrc()
 
-    update_apt()
 
     install_docker()
 
     print("\nAll configurations applied. Please restart your shell or source your .bashrc to apply changes.")
 
 if __name__ == "__main__":
-    configure_vim()
+    main()
