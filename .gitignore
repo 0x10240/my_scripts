@@ -1,1 +1,9 @@
 .idea
+.env
+.env.*
+node_modules/
+*.log
+*.tmp
+dist/
+build/
+coverage/
