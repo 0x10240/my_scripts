@@ -1,70 +1,27 @@
 #!/usr/bin/env python3
 
 import os
-import shutil
 import re
+import shutil
 import subprocess
-import glob
+import sys
+import tempfile
+from pathlib import Path
 
-# Function to uncomment lines matching a pattern in a file
-def uncomment_line(file_path, pattern):
-    if os.path.isfile(file_path):
-        with open(file_path, 'r') as f:
-            lines = f.readlines()
 
-        pattern_regex = re.compile(r'^#\s*' + re.escape(pattern))
-        with open(file_path, 'w') as f:
-            for line in lines:
-                if pattern_regex.match(line):
-                    line = pattern + '\n'
-                f.write(line)
-    else:
-        print(f"File {file_path} not found!")
+ROOT_HOME = Path("/root")
+BASHRC_FILE = ROOT_HOME / ".bashrc"
+INPUTRC_FILE = Path("/etc/inputrc")
+VIMRC_FILE = ROOT_HOME / ".vimrc"
 
-# Function to replace a line matching a pattern with a new line
-def replace_line(file_path, search_pattern, replacement):
-    if os.path.isfile(file_path):
-        with open(file_path, 'r') as f:
-            lines = f.readlines()
+BASHRC_START = "# >>> debian_init shell settings >>>"
+BASHRC_END = "# <<< debian_init shell settings <<<"
+BASHRC_CONTENT = """export LS_OPTIONS='--color=auto'
+eval "$(dircolors)"
+alias ls='ls $LS_OPTIONS'
+alias ll='ls $LS_OPTIONS -l'
+alias l='ls $LS_OPTIONS -lA'
 
-        pattern_regex = re.compile('^' + re.escape(search_pattern))
-        with open(file_path, 'w') as f:
-            for line in lines:
-                if pattern_regex.match(line):
-                    line = replacement + '\n'
-                f.write(line)
-    else:
-        print(f"File {file_path} not found!")
-
-# Function to append content to a file if it's not already present
-def append_content(file_path, marker, content):
-    if os.path.isfile(file_path):
-        with open(file_path, 'r') as f:
-            file_content = f.read()
-        if marker not in file_content:
-            with open(file_path, 'a') as f:
-                f.write('\n' + marker + '\n')
-                f.write(content + '\n')
-    else:
-        print(f"File {file_path} not found!")
-
-# Function to configure $HOME/.bashrc
-def configure_bashrc():
-    bashrc_file = os.path.expanduser("~/.bashrc")
-
-    # Backup the file
-    shutil.copy(bashrc_file, bashrc_file + '.bak')
-
-    # Uncomment required lines
-    uncomment_line(bashrc_file, "export LS_OPTIONS='--color=auto'")
-    uncomment_line(bashrc_file, "eval \"$(dircolors)\"")
-    uncomment_line(bashrc_file, "alias ls='ls $LS_OPTIONS'")
-    uncomment_line(bashrc_file, "alias ll='ls $LS_OPTIONS -l'")
-    uncomment_line(bashrc_file, "alias l='ls $LS_OPTIONS -lA'")
-
-    # Append history configurations
-    history_marker = "# Custom history configurations"
-    history_content = """
 # Append to the history file, don't overwrite it
 shopt -s histappend
 PROMPT_COMMAND='history -a; history -c; history -r'
@@ -72,81 +29,166 @@ HISTFILESIZE=10000
 HISTSIZE=1000
 HISTCONTROL=ignoredups:ignorespace
 """
-    append_content(bashrc_file, history_marker, history_content)
 
-# Function to configure /etc/inputrc
-def configure_inputrc():
-    inputrc_file = "/etc/inputrc"
+INPUTRC_START = "# >>> debian_init history search >>>"
+INPUTRC_END = "# <<< debian_init history search <<<"
+INPUTRC_CONTENT = "\"\\e[5~\": history-search-backward\n\"\\e[6~\": history-search-forward\n"
 
-    # Backup the file
+VIMRC_START = "\" >>> debian_init vim settings >>>"
+VIMRC_END = "\" <<< debian_init vim settings <<<"
+VIMRC_CONTENT = "set mouse-=a\n"
+
+
+def require_root():
+    if not hasattr(os, "geteuid") or os.geteuid() != 0:
+        raise PermissionError("This script must be run as root.")
+
+
+def backup_once(file_path):
+    backup_path = file_path.with_name(f"{file_path.name}.bak")
+    if file_path.exists() and not backup_path.exists():
+        shutil.copy2(file_path, backup_path)
+
+
+def atomic_write(file_path, content):
+    file_path.parent.mkdir(parents=True, exist_ok=True)
+
+    fd, temp_path = tempfile.mkstemp(
+        prefix=f".{file_path.name}.",
+        dir=str(file_path.parent),
+    )
+
     try:
-        shutil.copy(inputrc_file, inputrc_file + '.bak')
+        if file_path.exists():
+            os.fchmod(fd, file_path.stat().st_mode)
+        else:
+            os.fchmod(fd, 0o644)
 
-        # Uncomment required lines
-        uncomment_line(inputrc_file, '"\\e[5~": history-search-backward')
-        uncomment_line(inputrc_file, '"\\e[6~": history-search-forward')
-    except PermissionError:
-        print(f"Permission denied while modifying {inputrc_file}. Please run the script with sudo.")
-    except FileNotFoundError:
-        print(f"File {inputrc_file} not found!")
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write(content)
 
-# Function to configure Vim defaults
+        os.replace(temp_path, file_path)
+    except Exception:
+        if os.path.exists(temp_path):
+            os.unlink(temp_path)
+        raise
+
+
+def ensure_managed_block(file_path, start_marker, end_marker, content, create_if_missing=False):
+    if file_path.exists():
+        original_content = file_path.read_text(encoding="utf-8")
+    elif create_if_missing:
+        original_content = ""
+    else:
+        raise FileNotFoundError(f"File {file_path} not found.")
+
+    managed_block = f"{start_marker}\n{content.strip()}\n{end_marker}\n"
+    block_pattern = re.compile(
+        rf"{re.escape(start_marker)}\n.*?{re.escape(end_marker)}\n?",
+        re.DOTALL,
+    )
+
+    if block_pattern.search(original_content):
+        updated_content = block_pattern.sub(managed_block, original_content, count=1)
+    else:
+        separator = "\n" if original_content and not original_content.endswith("\n") else ""
+        updated_content = f"{original_content}{separator}{managed_block}"
+
+    if updated_content != original_content:
+        if file_path.exists():
+            backup_once(file_path)
+        atomic_write(file_path, updated_content)
+
+
+def run_command(command, description):
+    print(description)
+    subprocess.run(command, check=True)
+
+
+def configure_bashrc():
+    ensure_managed_block(
+        BASHRC_FILE,
+        BASHRC_START,
+        BASHRC_END,
+        BASHRC_CONTENT,
+        create_if_missing=True,
+    )
+
+
+def configure_inputrc():
+    ensure_managed_block(
+        INPUTRC_FILE,
+        INPUTRC_START,
+        INPUTRC_END,
+        INPUTRC_CONTENT,
+        create_if_missing=True,
+    )
+
+
 def configure_vim():
-    # Find the defaults.vim file regardless of the Vim version
-    vim_defaults_list = glob.glob('/usr/share/vim/vim*/defaults.vim')
-    if not vim_defaults_list:
-        print("defaults.vim not found!")
-        return
+    ensure_managed_block(
+        VIMRC_FILE,
+        VIMRC_START,
+        VIMRC_END,
+        VIMRC_CONTENT,
+        create_if_missing=True,
+    )
 
-    vim_defaults = vim_defaults_list[-1]  # Take the last one (assuming it's the latest version)
 
-    # Backup the file
-    shutil.copy(vim_defaults, vim_defaults + '.bak')
-
-    # Replace 'set mouse=a' with 'set mouse-=a'
-    replace_line(vim_defaults, '    set mouse=a', '    set mouse-=a')
-
-# Function to reload .bashrc (note: this won't affect the current shell session)
-def reload_bashrc():
-    print("Reloading .bashrc...")
-    subprocess.run(['source', os.path.expanduser('~/.bashrc')], shell=True)
-
-# Function to install Docker
-def install_docker():
-    subprocess.run(['curl', '-fsSL', 'https://get.docker.com', '-o', 'get-docker.sh'])
-    subprocess.run(['sh', 'get-docker.sh'])
-
-# Function to update apt package lists
 def update_apt():
-    print("Updating apt package lists...")
-    subprocess.run(['apt', 'update', '-y'])
+    run_command(["apt-get", "update"], "Updating apt package lists...")
+
 
 def install_curl():
-    print("Updating apt package lists...")
-    subprocess.run(['apt', 'inttall', 'curl', '-y'])
+    if shutil.which("curl"):
+        print("curl is already installed.")
+        return
+
+    run_command(["apt-get", "install", "-y", "curl"], "Installing curl...")
 
 
-# Main script execution
+def install_docker():
+    fd, docker_script_path = tempfile.mkstemp(prefix="get-docker-", suffix=".sh")
+    os.close(fd)
+
+    try:
+        run_command(
+            ["curl", "-fsSL", "https://get.docker.com", "-o", docker_script_path],
+            "Downloading Docker install script...",
+        )
+        run_command(["sh", docker_script_path], "Installing Docker...")
+    finally:
+        if os.path.exists(docker_script_path):
+            os.unlink(docker_script_path)
+
+
 def main():
-    print("Starting server initialization configurations...\n")
-    update_apt()
+    try:
+        require_root()
+        print("Starting server initialization configurations...\n")
 
-    configure_bashrc()
-    print(f"Configured {os.path.expanduser('~/.bashrc')}\n")
+        update_apt()
+        install_curl()
 
-    configure_inputrc()
-    print("Configured /etc/inputrc\n")
+        configure_bashrc()
+        print(f"Configured {BASHRC_FILE}\n")
 
-    configure_vim()
-    print("Configured Vim defaults\n")
+        configure_inputrc()
+        print(f"Configured {INPUTRC_FILE}\n")
 
-    # Note: Reloading .bashrc in a subprocess won't affect the current shell
-    reload_bashrc()
+        configure_vim()
+        print(f"Configured {VIMRC_FILE}\n")
 
+        install_docker()
 
-    install_docker()
+        print(
+            "\nAll configurations applied. Run `source /root/.bashrc` or start a new shell "
+            "to load the updated shell settings."
+        )
+    except (PermissionError, FileNotFoundError, OSError, subprocess.CalledProcessError) as exc:
+        print(f"\nInitialization failed: {exc}", file=sys.stderr)
+        raise SystemExit(1) from exc
 
-    print("\nAll configurations applied. Please restart your shell or source your .bashrc to apply changes.")
 
 if __name__ == "__main__":
     main()
