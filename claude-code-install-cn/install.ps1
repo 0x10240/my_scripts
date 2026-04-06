@@ -4,6 +4,7 @@ param(
     [string]$NodeMirrorBaseUrl = "https://npmmirror.com/mirrors/node",
     [string]$NpmRegistry = "https://registry.npmmirror.com",
     [string]$PackageName = "@anthropic-ai/claude-code",
+    [switch]$InstallGit,
     [string]$BaseUrl,
     [string]$AuthToken,
     [string]$ApiKey,
@@ -110,6 +111,17 @@ function Add-ToUserPath {
     }
 }
 
+function Refresh-ProcessPath {
+    $pathParts = @()
+    foreach ($scope in @("Machine", "User")) {
+        $scopePath = [Environment]::GetEnvironmentVariable("Path", $scope)
+        if (-not [string]::IsNullOrWhiteSpace($scopePath)) {
+            $pathParts += $scopePath.Split(";") | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+        }
+    }
+    $env:Path = ($pathParts | Select-Object -Unique) -join ";"
+}
+
 function Set-UserEnvironmentVariable {
     param(
         [string]$Name,
@@ -136,6 +148,41 @@ function Get-LatestLtsNodeVersion {
     }
 
     return [string]$match.version
+}
+
+function Find-GitExePath {
+    $commandPath = Get-CommandPath -Candidates @("git.exe", "git")
+    if ($commandPath) {
+        return $commandPath
+    }
+
+    $candidatePaths = @(
+        (Join-Path $env:ProgramFiles "Git\cmd\git.exe"),
+        (Join-Path $env:ProgramFiles "Git\bin\git.exe"),
+        (Join-Path ${env:ProgramFiles(x86)} "Git\cmd\git.exe"),
+        (Join-Path ${env:ProgramFiles(x86)} "Git\bin\git.exe"),
+        (Join-Path $env:LOCALAPPDATA "Programs\Git\cmd\git.exe"),
+        (Join-Path $env:LOCALAPPDATA "Programs\Git\bin\git.exe")
+    ) | Where-Object { $_ -and (Test-Path -LiteralPath $_) }
+
+    return $candidatePaths | Select-Object -First 1
+}
+
+function Find-GitBashPath {
+    if (-not [string]::IsNullOrWhiteSpace($env:CLAUDE_CODE_GIT_BASH_PATH) -and (Test-Path -LiteralPath $env:CLAUDE_CODE_GIT_BASH_PATH)) {
+        return [System.IO.Path]::GetFullPath($env:CLAUDE_CODE_GIT_BASH_PATH)
+    }
+
+    $candidatePaths = @(
+        (Join-Path $env:ProgramFiles "Git\bin\bash.exe"),
+        (Join-Path $env:ProgramFiles "Git\usr\bin\bash.exe"),
+        (Join-Path ${env:ProgramFiles(x86)} "Git\bin\bash.exe"),
+        (Join-Path ${env:ProgramFiles(x86)} "Git\usr\bin\bash.exe"),
+        (Join-Path $env:LOCALAPPDATA "Programs\Git\bin\bash.exe"),
+        (Join-Path $env:LOCALAPPDATA "Programs\Git\usr\bin\bash.exe")
+    ) | Where-Object { $_ -and (Test-Path -LiteralPath $_) }
+
+    return $candidatePaths | Select-Object -First 1
 }
 
 function Get-WindowsArchitecture {
@@ -167,6 +214,55 @@ function Get-WindowsArchitecture {
     }
 
     throw "Unsupported Windows architecture. Only x64 and arm64 are supported."
+}
+
+function Ensure-WindowsGit {
+    param([switch]$AutoInstall)
+
+    $gitExePath = Find-GitExePath
+    $gitBashPath = Find-GitBashPath
+
+    if (-not $gitExePath -or -not $gitBashPath) {
+        if (-not $AutoInstall) {
+            Write-WarnLine "git/git-bash was not found. Claude Code on Windows requires Git Bash."
+            Write-WarnLine "Install Git for Windows manually, or rerun this script with -InstallGit."
+            $wingetPath = Get-CommandPath -Candidates @("winget.exe", "winget")
+            if ($wingetPath) {
+                Write-WarnLine "Optional command: winget install Git.Git"
+            }
+            return $false
+        }
+
+        $wingetPath = Get-CommandPath -Candidates @("winget.exe", "winget")
+        if (-not $wingetPath) {
+            throw "Git for Windows is required on Windows, but git was not found and winget is unavailable. Install Git from https://git-scm.com/download/win and rerun this script."
+        }
+
+        Write-WarnLine "git was not found. Installing Git for Windows with winget."
+        & $wingetPath install --id Git.Git --exact --source winget --silent --accept-package-agreements --accept-source-agreements --disable-interactivity
+        Refresh-ProcessPath
+
+        $gitExePath = Find-GitExePath
+        $gitBashPath = Find-GitBashPath
+    }
+
+    if (-not $gitExePath) {
+        throw "Git for Windows installation finished, but git.exe was still not found."
+    }
+
+    $gitCmdDir = Split-Path -Parent $gitExePath
+    if (-not (Get-CommandPath -Candidates @("git.exe", "git"))) {
+        Add-ToUserPath -PathToAdd $gitCmdDir
+    }
+
+    if (-not $gitBashPath) {
+        throw "Git for Windows installation finished, but bash.exe was still not found. Set CLAUDE_CODE_GIT_BASH_PATH manually if Git is installed in a custom location."
+    }
+
+    Set-UserEnvironmentVariable -Name "CLAUDE_CODE_GIT_BASH_PATH" -Value $gitBashPath
+    & $gitExePath --version | Out-Null
+    Write-Success "Git for Windows is ready"
+    return $true
 }
 
 function Install-PortableNode {
@@ -254,12 +350,7 @@ try {
     Write-Info "Install root: $InstallRoot"
     Ensure-Directory -Path $InstallRoot
 
-    if (-not (Get-CommandPath -Candidates @("git.exe", "git"))) {
-        Write-WarnLine "git was not found. Anthropic's docs say Windows requires Git for Windows."
-        if (Get-CommandPath -Candidates @("winget.exe", "winget")) {
-            Write-WarnLine "Optional command: winget install Git.Git"
-        }
-    }
+    $gitReady = Ensure-WindowsGit -AutoInstall:$InstallGit
 
     $toolchain = Resolve-NodeToolchain
     $nodePath = $toolchain.NodePath
@@ -292,6 +383,12 @@ try {
         throw "Install completed but $claudeCmd was not found."
     }
 
+    $claudePs1 = Join-Path $prefixDir "claude.ps1"
+    if (Test-Path -LiteralPath $claudePs1) {
+        Remove-Item -LiteralPath $claudePs1 -Force
+        Write-Info "Removed claude.ps1 so PowerShell resolves claude.cmd"
+    }
+
     Set-UserEnvironmentVariable -Name "ANTHROPIC_BASE_URL" -Value $BaseUrl
     Set-UserEnvironmentVariable -Name "ANTHROPIC_AUTH_TOKEN" -Value $AuthToken
     Set-UserEnvironmentVariable -Name "ANTHROPIC_API_KEY" -Value $ApiKey
@@ -300,18 +397,21 @@ try {
     $claudeVersion = & $claudeCmd --version
     Write-Success "Claude Code installed successfully: $claudeVersion"
 
-    $sessionPathHint = if ($isPortableNode) {
-        "$prefixDir;$nodeHome;$env:Path"
-    } else {
-        "$prefixDir;$env:Path"
-    }
-
     Write-Host ""
     Write-Host "Next steps:"
-    Write-Host "1. Reopen your terminal, or run: `$env:Path = `"$sessionPathHint`""
-    Write-Host "2. Run: claude"
+    Write-Host "1. Reopen your terminal, or run: `$env:Path = `"$env:Path`""
+    if (-not $gitReady) {
+        Write-Host "2. Install Git for Windows, or rerun this script with -InstallGit."
+        Write-Host "3. Run: claude"
+    } else {
+        Write-Host "2. Run: claude"
+    }
     if ([string]::IsNullOrWhiteSpace($BaseUrl) -and [string]::IsNullOrWhiteSpace($AuthToken) -and [string]::IsNullOrWhiteSpace($ApiKey)) {
-        Write-Host "3. If you use a CN gateway/proxy, rerun this script with -BaseUrl plus -AuthToken or -ApiKey."
+        if (-not $gitReady) {
+            Write-Host "4. If you use a CN gateway/proxy, rerun this script with -BaseUrl plus -AuthToken or -ApiKey."
+        } else {
+            Write-Host "3. If you use a CN gateway/proxy, rerun this script with -BaseUrl plus -AuthToken or -ApiKey."
+        }
     }
 } catch {
     Write-Host ""
