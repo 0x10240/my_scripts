@@ -21,16 +21,10 @@ BASHRC_END = "# <<< debian_init shell settings <<<"
 BASHRC_SOURCE_LINE = f"[ -f {BASHRC_INCLUDE_FILE} ] && . {BASHRC_INCLUDE_FILE}"
 
 ROOT_PROMPT = (
-    r'${debian_chroot:+($debian_chroot)}${PROMPT_RED}\u${PROMPT_YELLOW}@'
-    r'${PROMPT_CYAN}\h ${PROMPT_YELLOW}\w ${PROMPT_MAGENTA}\$ ${PROMPT_RESET}'
+    r'${debian_chroot:+($debian_chroot)}\[\033[01;31m\]\u\[\033[01;33m\]@'
+    r'\[\033[01;36m\]\h \[\033[01;33m\]\w \[\033[01;35m\]\$ \[\033[00m\]'
 )
 BASHRC_INCLUDE_CONTENT = """
-PROMPT_RED='\\[\\033[01;31m\\]'
-PROMPT_YELLOW='\\[\\033[01;33m\\]'
-PROMPT_CYAN='\\[\\033[01;36m\\]'
-PROMPT_MAGENTA='\\[\\033[01;35m\\]'
-PROMPT_RESET='\\[\\033[00m\\]'
-
 export LS_OPTIONS='--color=auto'
 eval "$(dircolors)"
 alias ls='ls $LS_OPTIONS'
