@@ -6,6 +6,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 
@@ -78,6 +79,13 @@ INPUTRC_CONTENT = "\"\\e[5~\": history-search-backward\n\"\\e[6~\": history-sear
 VIMRC_START = "\" >>> debian_init vim settings >>>"
 VIMRC_END = "\" <<< debian_init vim settings <<<"
 VIMRC_CONTENT = "set mouse-=a\n"
+
+APT_RETRYABLE_METADATA_ERRORS = (
+    "File has unexpected size",
+    "Hash Sum mismatch",
+    "Mirror sync in progress",
+)
+DOCKER_APT_LIST_PATTERN = "download.docker.com_linux_debian*"
 
 
 def require_root():
@@ -163,6 +171,29 @@ def run_command(command, description):
     subprocess.run(command, check=True)
 
 
+def is_retryable_apt_metadata_error(output):
+    return any(error in output for error in APT_RETRYABLE_METADATA_ERRORS)
+
+
+def clean_docker_apt_indexes():
+    removed_count = 0
+
+    for lists_dir in (Path("/var/lib/apt/lists"), Path("/var/lib/apt/lists/partial")):
+        if not lists_dir.exists():
+            continue
+
+        for index_path in lists_dir.glob(DOCKER_APT_LIST_PATTERN):
+            if not index_path.is_file() and not index_path.is_symlink():
+                continue
+
+            index_path.unlink()
+            removed_count += 1
+
+    subprocess.run(["apt-get", "clean"], check=False)
+    if removed_count:
+        print(f"Removed {removed_count} cached Docker apt index file(s).")
+
+
 def configure_bashrc():
     cleanup_legacy_bashrc(BASHRC_FILE)
     atomic_write(BASHRC_INCLUDE_FILE, BASHRC_INCLUDE_CONTENT + "\n")
@@ -196,7 +227,43 @@ def configure_vim():
 
 
 def update_apt():
-    run_command(["apt-get", "update"], "Updating apt package lists...")
+    print("Updating apt package lists...")
+
+    max_attempts = 3
+    last_result = None
+
+    for attempt in range(1, max_attempts + 1):
+        if attempt > 1:
+            print(f"Retrying apt-get update ({attempt}/{max_attempts})...")
+
+        result = subprocess.run(
+            ["apt-get", "update"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            check=False,
+        )
+        last_result = result
+
+        if result.stdout:
+            print(result.stdout, end="" if result.stdout.endswith("\n") else "\n")
+
+        if result.returncode == 0:
+            return
+
+        if attempt < max_attempts and is_retryable_apt_metadata_error(result.stdout or ""):
+            print("Apt repository metadata appears out of sync; cleaning Docker apt cache before retry...")
+            clean_docker_apt_indexes()
+            time.sleep(3)
+            continue
+
+        break
+
+    raise subprocess.CalledProcessError(
+        last_result.returncode,
+        ["apt-get", "update"],
+        output=last_result.stdout,
+    )
 
 
 def install_curl():
